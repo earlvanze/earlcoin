@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'frontend/**'
+      - 'src/**'
       - '.github/workflows/deploy-hostinger.yml'
   workflow_dispatch:
 
@@ -21,6 +22,12 @@ jobs:
           node-version: 20
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Copy env vars
+        run: cp .env.local frontend/.env.local
+
+      - name: Sync src to frontend/src
+        run: rsync -av --delete src/ frontend/src/
 
       - name: Install and build
         run: |

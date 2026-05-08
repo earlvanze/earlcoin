@@ -13,7 +13,7 @@ import { cn } from '@/lib/utils';
 import { fetchLoftyPropertyItems, fetchLpPrices } from '@/lib/loftyDeals';
 import { algodClient, getKycRegistryStatus } from '@/lib/algorand';
 import { WALLETS, INDEXER_BASE, LOFTY_API } from '@/lib/wallets';
-import { EARL_ASA_ID, INKIND_EXCHANGE_APP_ID, VNFT_ASA_ID, KYC_REGISTRY_APP_ID } from '@/lib/config';
+import { EARL_ASA_ID, INKIND_EXCHANGE_APP_ID, KYC_REGISTRY_APP_ID } from '@/lib/config';
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -184,7 +184,7 @@ async function buildAtomicSwapGroup({
       new TextEncoder().encode('exchange'),
     ],
     foreignApps: kycRegistryAppId ? [adminAppId, lpInterfaceAppId, kycRegistryAppId] : [adminAppId, lpInterfaceAppId],
-    foreignAssets: kycRegistryAppId ? [loftyAsaId, EARL_ASA_ID] : [loftyAsaId, EARL_ASA_ID, VNFT_ASA_ID],
+    foreignAssets: [loftyAsaId, EARL_ASA_ID],
     boxes: [{ appIndex: 0, name: algosdk.encodeUint64(loftyAsaId) }],
     suggestedParams: appCallParams,
   });
@@ -261,7 +261,7 @@ const HoldingRow = ({ holding, selected, onToggle, disabled, reason, lpPrice, pr
 const LoftySwap = () => {
   const { toast } = useToast();
   const { user } = useAuth();
-  const { isConnected, accountAddress, handleConnect, peraWallet, kycVerified, hasVerificationNft } = useAppContext();
+  const { isConnected, accountAddress, handleConnect, peraWallet, kycVerified } = useAppContext();
 
   const [holdings, setHoldings] = useState([]);
   const [lpPrices, setLpPrices] = useState({});
@@ -430,7 +430,7 @@ const LoftySwap = () => {
     return { totalUsdValue: usd, totalEarl: earl, selectedHoldings: sel };
   }, [holdingsWithStatus, selectedIds]);
 
-  const hasOnChainCredential = registryGateEnabled ? !!registryStatus?.active : hasVerificationNft;
+  const hasOnChainCredential = !!registryStatus?.active;
   const estimatedEarlMicro = Math.ceil(totalEarl * 10 ** EARL_DECIMALS);
   const hasSufficientAppEarl = !isContractMode || appEarlBalance >= estimatedEarlMicro;
   const canSwap = selectedHoldings.length > 0 && totalEarl > 0 && !submitting && kycVerified && hasOnChainCredential && hasSufficientAppEarl;
@@ -455,7 +455,6 @@ const LoftySwap = () => {
       toast({ variant: 'destructive', title: 'On-chain verification required', description });
       return;
     }
-    if (!registryGateEnabled && !hasVerificationNft) { toast({ variant: 'destructive', title: 'Verification NFT required', description: 'Your connected wallet must hold the EarlCoin verification NFT before the on-chain swap can pass contract checks.' }); return; }
     if (!hasSufficientAppEarl) { toast({ variant: 'destructive', title: 'Exchange needs EARL funding', description: 'The in-kind exchange contract does not have enough EARL to settle this swap yet.' }); return; }
     if (!canSwap) { toast({ variant: 'destructive', title: 'Select tokens with price data' }); return; }
 
