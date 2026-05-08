@@ -10,10 +10,10 @@ import { useToast } from '@/components/ui/use-toast';
 import { useAppContext } from '@/contexts/AppContext';
 import { useAuth } from '@/contexts/SupabaseAuthContext';
 import { cn } from '@/lib/utils';
-import { fetchLpPrices } from '@/lib/loftyDeals';
-import { algodClient } from '@/lib/algorand';
+import { fetchLoftyPropertyItems, fetchLpPrices } from '@/lib/loftyDeals';
+import { algodClient, getKycRegistryStatus } from '@/lib/algorand';
 import { WALLETS, INDEXER_BASE, LOFTY_API } from '@/lib/wallets';
-import { EARL_ASA_ID, INKIND_EXCHANGE_APP_ID, VNFT_ASA_ID } from '@/lib/config';
+import { EARL_ASA_ID, INKIND_EXCHANGE_APP_ID, VNFT_ASA_ID, KYC_REGISTRY_APP_ID } from '@/lib/config';
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -43,6 +43,18 @@ const LOFTY_CREATORS = new Set([
 ]);
 
 const LOFTY_UNIT_PREFIXES = ['LFTY'];
+const LOFTY_NAME_PATTERNS = [/\bLOFTY\b/i, /LOFTY\s+(PROPERTY|AI|TOKEN)/i];
+
+function isLikelyLoftyToken(holding) {
+  if (!holding) return false;
+  const unitName = (holding.unitName || '').toUpperCase();
+  const name = holding.name || '';
+  return Boolean(
+    holding.isLoftyCreator
+    || LOFTY_UNIT_PREFIXES.some(p => unitName.startsWith(p))
+    || LOFTY_NAME_PATTERNS.some((pattern) => pattern.test(name))
+  );
+}
 
 function isLpToken(unitName, name) {
   const u = (unitName || '').toUpperCase();
@@ -55,7 +67,7 @@ async function fetchLoftyHoldings(walletAddress) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Indexer error: ${res.status}`);
   const data = await res.json();
-  const assets = (data.assets || []).filter((a) => a.amount > 0);
+  const assets = (data.account?.assets || data.assets || []).filter((a) => Number(a.amount) > 0);
   if (assets.length === 0) return [];
 
   // Batch asset lookups — use account response which already includes creator info
@@ -76,15 +88,16 @@ async function fetchLoftyHoldings(walletAddress) {
           const isLoftyCreator = LOFTY_CREATORS.has(params.creator || '');
           const unitName = (params['unit-name'] || '').toUpperCase();
           const isLoftyUnit = LOFTY_UNIT_PREFIXES.some(p => unitName.startsWith(p));
-          if (!isLoftyCreator && !isLoftyUnit) return null;
           return {
             assetId: asset['asset-id'],
             amount: asset.amount,
             decimals: params.decimals || 0,
             name: params.name || `ASA ${asset['asset-id']}`,
             unitName: params['unit-name'] || '',
-            defaultFrozen: params['default-frozen'] || false,
+            defaultFrozen: asset['is-frozen'] ?? params['default-frozen'] ?? false,
             total: params.total || 0,
+            isLoftyCreator,
+            isLoftyUnit,
           };
         } catch { return null; }
       })
@@ -108,9 +121,7 @@ const getLoftyContractId = (liquidityPool, key) => (
 
 async function fetchLoftyAssistProperties() {
   try {
-    const res = await fetch(LOFTY_API);
-    if (!res.ok) return {};
-    const items = await res.json();
+    const items = await fetchLoftyPropertyItems({ includeAssistFallback: true });
     const map = {};
     for (const item of items) {
       const p = item?.property || {};
@@ -119,18 +130,25 @@ async function fetchLoftyAssistProperties() {
         address: p.address || 'Unknown',
         city: p.market || p.city || '',
         state: p.state || '',
-        tokenValue: p.tokenValue || null,
+        tokenValue: lp.price || lp.priceLow || p.tokenValue || null,
         listingStatus: p.listingStatus || null,
-        // LP interface app ID for DODO PMM on-chain pricing
+        assetName: p.assetName || null,
+        assetUnit: p.assetUnit || null,
+        // LP interface app ID for DODO PMM on-chain pricing. Direct Lofty data is primary;
+        // LoftyAssist fallback enriches these contracts when direct payload does not include them.
         lpInterfaceAppId: getLoftyContractId(lp, 'lpInterface'),
         // Admin app ID stores oracle + k params
         adminAppId: getLoftyContractId(lp, 'admin')
       };
-      if (p.assetId) map[p.assetId] = entry;
-      if (p.newAssetId) map[p.newAssetId] = entry;
+      for (const id of [p.assetId, p.newAssetId, p.legacyAssetId, p.migratedAssetId, ...(Array.isArray(p.assetIds) ? p.assetIds : [])]) {
+        if (id !== null && id !== undefined && id !== '') map[Number(id)] = entry;
+      }
     }
     return map;
-  } catch { return {}; }
+  } catch (error) {
+    console.warn('Lofty property metadata unavailable:', error);
+    return {};
+  }
 }
 
 /**
@@ -148,6 +166,7 @@ async function buildAtomicSwapGroup({
   adminAppId,
   lpInterfaceAppId,
   peraWallet,
+  kycRegistryAppId = KYC_REGISTRY_APP_ID,
 }) {
   const params = await algodClient.getTransactionParams().do();
   const appCallParams = { ...params, fee: 2000, flatFee: true };
@@ -164,8 +183,8 @@ async function buildAtomicSwapGroup({
     appArgs: [
       new TextEncoder().encode('exchange'),
     ],
-    foreignApps: [adminAppId, lpInterfaceAppId],
-    foreignAssets: [loftyAsaId, EARL_ASA_ID, VNFT_ASA_ID],
+    foreignApps: kycRegistryAppId ? [adminAppId, lpInterfaceAppId, kycRegistryAppId] : [adminAppId, lpInterfaceAppId],
+    foreignAssets: kycRegistryAppId ? [loftyAsaId, EARL_ASA_ID] : [loftyAsaId, EARL_ASA_ID, VNFT_ASA_ID],
     boxes: [{ appIndex: 0, name: algosdk.encodeUint64(loftyAsaId) }],
     suggestedParams: appCallParams,
   });
@@ -242,7 +261,7 @@ const HoldingRow = ({ holding, selected, onToggle, disabled, reason, lpPrice, pr
 const LoftySwap = () => {
   const { toast } = useToast();
   const { user } = useAuth();
-  const { isConnected, accountAddress, handleConnect, peraWallet, kycVerified } = useAppContext();
+  const { isConnected, accountAddress, handleConnect, peraWallet, kycVerified, hasVerificationNft } = useAppContext();
 
   const [holdings, setHoldings] = useState([]);
   const [lpPrices, setLpPrices] = useState({});
@@ -252,30 +271,56 @@ const LoftySwap = () => {
   const [submitting, setSubmitting] = useState(false);
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [searchFilter, setSearchFilter] = useState('');
+  const [scanDebug, setScanDebug] = useState(null);
+  const [registryStatus, setRegistryStatus] = useState(null);
+  const [appEarlBalance, setAppEarlBalance] = useState(0);
 
   const appId = INKIND_EXCHANGE_APP_ID;
+  const registryAppId = KYC_REGISTRY_APP_ID;
+  const registryGateEnabled = registryAppId > 0;
 
   useEffect(() => {
-    if (!isConnected || !accountAddress) { setHoldings([]); return; }
+    if (!isConnected || !accountAddress) { setHoldings([]); setScanDebug(null); return; }
     const load = async () => {
       setLoading(true);
       try {
-        const [rawHoldings, prices, meta] = await Promise.all([
+        const [rawHoldings, prices, meta, registry] = await Promise.all([
           fetchLoftyHoldings(accountAddress),
           fetchLpPrices(),
           fetchLoftyAssistProperties(),
+          getKycRegistryStatus(accountAddress, registryAppId),
         ]);
+        setRegistryStatus(registry);
 
         // SECURITY #1: Filter out LP pool tokens
         let filtered = rawHoldings.filter(h => !isLpToken(h.unitName, h.name));
 
-        // SECURITY #5: LoftyAssist property allowlist — fail closed if no data
-        if (Object.keys(meta).length > 0) {
-          filtered = filtered.filter(h => meta[h.assetId]);
-        } else {
-          filtered = [];
-        }
-
+        // Include both the explicit LoftyAssist migration allowlist and on-chain Lofty
+        // metadata. The allowlist can lag migrated/legacy wallet holdings, but creator/unit
+        // metadata comes from the Algorand asset itself and should not be hidden.
+        const allowlisted = Object.keys(meta).length > 0 ? filtered.filter(h => meta[h.assetId]) : [];
+        const metadataFiltered = filtered.filter(h => isLikelyLoftyToken(h));
+        const seen = new Set();
+        filtered = [...allowlisted, ...metadataFiltered].filter((h) => {
+          if (seen.has(h.assetId)) return false;
+          seen.add(h.assetId);
+          return true;
+        });
+        const rejected = rawHoldings.filter(h => !isLpToken(h.unitName, h.name)).filter(h => !filtered.some(f => f.assetId === h.assetId));
+        const networkDebug = { NETWORK: import.meta.env.VITE_NETWORK, indexerUrl: import.meta.env.VITE_INDEXER_URL || INDEXER_BASE, algodUrl: import.meta.env.VITE_ALGOD_URL };
+        const holdingsDebug = {
+          accountAddress,
+          raw: rawHoldings.length,
+          nonLp: rawHoldings.filter(h => !isLpToken(h.unitName, h.name)).length,
+          allowlisted: allowlisted.length,
+          metadata: metadataFiltered.length,
+          final: filtered.length,
+          rejectedIds: rejected.map(h => h.assetId),
+          rejectedUnits: rejected.map(h => h.unitName),
+          acceptedIds: filtered.map(h => h.assetId),
+        };
+        console.info('LoftySwap network context', networkDebug);
+        console.info('LoftySwap holdings filter', holdingsDebug);
         // Fetch app's opt-in status for ASA readiness check
         let optedIn = new Set();
         if (appId && appId > 0) {
@@ -283,19 +328,46 @@ const LoftySwap = () => {
             const appAddr = algosdk.getApplicationAddress(appId);
             const appAcct = await algodClient.accountInformation(appAddr).do();
             optedIn = new Set((appAcct.assets || []).map(a => a['asset-id']));
-          } catch { /* ignore — will show all as needing setup */ }
+            const earlHolding = (appAcct.assets || []).find((a) => a['asset-id'] === EARL_ASA_ID);
+            setAppEarlBalance(Number(earlHolding?.amount || 0));
+          } catch { setAppEarlBalance(0); /* ignore — will show all as needing setup */ }
         }
         setAppOptedInAsas(optedIn);
 
         setHoldings(filtered);
         setLpPrices(prices);
         setPropertyMap(meta);
+        setScanDebug({ ...networkDebug, ...holdingsDebug, appOptedInCount: optedIn.size, kycRegistryAppId: registryAppId, registryActive: registry?.active });
       } catch (err) {
+        setScanDebug({ accountAddress, error: err?.message || String(err), NETWORK: import.meta.env.VITE_NETWORK, indexerUrl: import.meta.env.VITE_INDEXER_URL || INDEXER_BASE, algodUrl: import.meta.env.VITE_ALGOD_URL });
         toast({ variant: 'destructive', title: 'Load failed', description: err.message });
       } finally { setLoading(false); }
     };
     load();
-  }, [isConnected, accountAddress, toast]);
+  }, [isConnected, accountAddress, toast, appId, registryAppId]);
+
+
+  const handleRegistryOptIn = async () => {
+    if (!registryGateEnabled || !accountAddress) return;
+    try {
+      const params = await algodClient.getTransactionParams().do();
+      const txn = algosdk.makeApplicationOptInTxnFromObject({
+        from: accountAddress,
+        appIndex: registryAppId,
+        suggestedParams: params,
+      });
+      const signed = await peraWallet.signTransaction([[{ txn, signers: [accountAddress] }]], accountAddress);
+      const { txId } = await algodClient.sendRawTransaction(signed).do();
+      await algosdk.waitForConfirmation(algodClient, txId, 6);
+      const nextStatus = await getKycRegistryStatus(accountAddress, registryAppId);
+      setRegistryStatus(nextStatus);
+      toast({ title: 'Registry opt-in complete', description: 'Your wallet can now be activated by the KYC registry admin.' });
+    } catch (err) {
+      const msg = err?.message || String(err);
+      const isCancel = /cancel|reject|deny|closed/i.test(msg);
+      toast({ variant: 'destructive', title: isCancel ? 'Cancelled' : 'Registry opt-in failed', description: msg });
+    }
+  };
 
   const toggleSelect = useCallback((id) => {
     setSelectedIds((prev) => {
@@ -358,7 +430,10 @@ const LoftySwap = () => {
     return { totalUsdValue: usd, totalEarl: earl, selectedHoldings: sel };
   }, [holdingsWithStatus, selectedIds]);
 
-  const canSwap = selectedHoldings.length > 0 && totalEarl > 0 && !submitting && kycVerified;
+  const hasOnChainCredential = registryGateEnabled ? !!registryStatus?.active : hasVerificationNft;
+  const estimatedEarlMicro = Math.ceil(totalEarl * 10 ** EARL_DECIMALS);
+  const hasSufficientAppEarl = !isContractMode || appEarlBalance >= estimatedEarlMicro;
+  const canSwap = selectedHoldings.length > 0 && totalEarl > 0 && !submitting && kycVerified && hasOnChainCredential && hasSufficientAppEarl;
 
   /**
    * Atomic swap using the in-kind exchange smart contract.
@@ -371,6 +446,17 @@ const LoftySwap = () => {
    */
   const handleSwap = async () => {
     if (!kycVerified) { toast({ variant: 'destructive', title: 'KYC required' }); return; }
+    if (registryGateEnabled && !registryStatus?.active) {
+      const description = !registryStatus?.optedIn
+        ? 'Your wallet must opt into the EarlCoin KYC registry before it can be verified on-chain.'
+        : registryStatus?.blocked
+          ? 'This wallet is blocked in the EarlCoin KYC registry.'
+          : 'This wallet is not active in the EarlCoin KYC registry yet.';
+      toast({ variant: 'destructive', title: 'On-chain verification required', description });
+      return;
+    }
+    if (!registryGateEnabled && !hasVerificationNft) { toast({ variant: 'destructive', title: 'Verification NFT required', description: 'Your connected wallet must hold the EarlCoin verification NFT before the on-chain swap can pass contract checks.' }); return; }
+    if (!hasSufficientAppEarl) { toast({ variant: 'destructive', title: 'Exchange needs EARL funding', description: 'The in-kind exchange contract does not have enough EARL to settle this swap yet.' }); return; }
     if (!canSwap) { toast({ variant: 'destructive', title: 'Select tokens with price data' }); return; }
 
     // Re-verify no disabled tokens
@@ -383,6 +469,12 @@ const LoftySwap = () => {
     setSubmitting(true);
 
     try {
+      const accountInfo = await algodClient.accountInformation(accountAddress).do();
+      const earlOptedIn = (accountInfo.assets || []).some((asset) => asset['asset-id'] === EARL_ASA_ID);
+      if (!earlOptedIn) {
+        throw new Error('Your wallet is not opted into EARL yet. Opt into the EARL ASA first, then retry the Lofty swap.');
+      }
+
       if (appId && appId > 0) {
         // ═══════════════════════════════════════════════
         // SMART CONTRACT PATH: Atomic trustless swap
@@ -408,6 +500,7 @@ const LoftySwap = () => {
             adminAppId,
             lpInterfaceAppId,
             peraWallet,
+            kycRegistryAppId: registryAppId,
           });
 
           // Sign both transactions with Pera wallet
@@ -442,7 +535,7 @@ const LoftySwap = () => {
       }
 
       setSelectedIds(new Set());
-      setHoldings(await fetchLoftyHoldings(accountAddress));
+      setHoldings((current) => current.filter((holding) => !selectedIds.has(holding.assetId)));
     } catch (err) {
       console.error('Lofty swap failed:', err);
       const msg = err?.message || String(err);
@@ -494,15 +587,45 @@ const LoftySwap = () => {
         </motion.div>
       )}
 
-      {isConnected && !kycVerified && (
+      {isConnected && (!kycVerified || !hasOnChainCredential) && (
         <motion.div variants={itemVariants} className="mb-6">
           <Card className="border-yellow-500/30 bg-yellow-500/5">
             <CardContent className="py-4 flex items-start gap-3">
               <AlertTriangle className="h-5 w-5 text-yellow-400 mt-0.5" />
-              <div>
-                <p className="font-medium">KYC verification required</p>
-                <p className="text-sm text-muted-foreground">Complete identity verification before swapping Lofty tokens for EARL.</p>
+              <div className="flex-1">
+                <p className="font-medium">KYC and on-chain verification required</p>
+                <p className="text-sm text-muted-foreground">Complete identity verification and make sure this wallet is active in the EarlCoin KYC registry before swapping Lofty tokens for EARL.</p>
+                {registryGateEnabled && registryStatus && !registryStatus.optedIn && (
+                  <Button onClick={handleRegistryOptIn} variant="outline" size="sm" className="mt-3">Opt into KYC registry</Button>
+                )}
+                {registryGateEnabled && registryStatus?.blocked && (
+                  <p className="text-sm text-destructive mt-2">This wallet is currently blocked.</p>
+                )}
               </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+      )}
+
+      {isConnected && scanDebug && (import.meta.env.DEV || new URLSearchParams(window.location.search).has('debug')) && (
+        <motion.div variants={itemVariants} className="mb-6">
+          <Card className="border-blue-500/30 bg-blue-500/5">
+            <CardContent className="py-4 text-xs space-y-1">
+              <p className="font-medium text-blue-300">LoftySwap debug</p>
+              <p className="font-mono break-all">wallet: {scanDebug.accountAddress || 'none'}</p>
+              <p>network: {scanDebug.NETWORK || 'mainnet'}</p>
+              <p className="font-mono break-all">indexer: {scanDebug.indexerUrl || 'default'}</p>
+              {scanDebug.error ? (
+                <p className="text-red-300">error: {scanDebug.error}</p>
+              ) : (
+                <p>raw: {scanDebug.raw} · nonLP: {scanDebug.nonLp} · allowlisted: {scanDebug.allowlisted} · metadata: {scanDebug.metadata} · final: {scanDebug.final} · app opted: {scanDebug.appOptedInCount}</p>
+              )}
+              {registryGateEnabled && (
+                <p>registry: {scanDebug.kycRegistryAppId || 'none'} · active: {String(scanDebug.registryActive)} · app EARL: {(appEarlBalance / 10 ** EARL_DECIMALS).toLocaleString()}</p>
+              )}
+              {Array.isArray(scanDebug.rejectedIds) && scanDebug.rejectedIds.length > 0 && (
+                <p className="font-mono break-all">rejected: {scanDebug.rejectedIds.join(', ')}</p>
+              )}
             </CardContent>
           </Card>
         </motion.div>
@@ -583,6 +706,9 @@ const LoftySwap = () => {
                     <strong>Atomic swap:</strong> Your Lofty tokens transfer to the smart contract, which computes the DODO PMM price
                     on-chain and sends EARL back in the same transaction group. No trust required.
                     Final EARL amount is determined by the on-chain PMM formula, not the estimate above.
+                    {!hasSufficientAppEarl && (
+                      <span className="block mt-2 text-yellow-300">The exchange needs more EARL funding before this estimated swap can settle.</span>
+                    )}
                   </>
                 ) : (
                   <>
@@ -592,7 +718,7 @@ const LoftySwap = () => {
               </div>
               <Button onClick={handleSwap} className="h-auto min-h-11 w-full whitespace-normal bg-green-600 px-3 text-center hover:bg-green-700 text-white" size="lg" disabled={!canSwap || !isContractMode}>
                 {submitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <ArrowRightLeft className="mr-2 h-4 w-4" />}
-                {!isContractMode ? 'Contract Not Deployed' : `Swap ${selectedHoldings.length} Token${selectedHoldings.length !== 1 ? 's' : ''} → EARL`}
+                {!isContractMode ? 'Contract Not Deployed' : !hasSufficientAppEarl ? 'Exchange Needs EARL Funding' : `Swap ${selectedHoldings.length} Token${selectedHoldings.length !== 1 ? 's' : ''} → EARL`}
               </Button>
             </CardContent>
           </Card>

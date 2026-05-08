@@ -21,7 +21,7 @@ from pyteal import *
 
 ADMIN_KEY = Bytes("admin")
 EARL_ASA_KEY = Bytes("earl_asa")
-VNFT_ASA_KEY = Bytes("vnft_asa")
+KYC_REGISTRY_APP_KEY = Bytes("kyc_registry_app")
 EARL_PRICE_KEY = Bytes("earl_price")
 PAUSED_KEY = Bytes("paused")
 NUM_ACCEPTED_KEY = Bytes("num_accepted")
@@ -43,17 +43,29 @@ K_DENOM = Int(1000000)
 def approval_program():
     is_admin = Txn.sender() == App.globalGet(ADMIN_KEY)
     earl_asa = App.globalGet(EARL_ASA_KEY)
-    vnft_asa = App.globalGet(VNFT_ASA_KEY)
+    kyc_registry_app = App.globalGet(KYC_REGISTRY_APP_KEY)
     earl_price = App.globalGet(EARL_PRICE_KEY)
     paused = App.globalGet(PAUSED_KEY)
 
-    vnft_balance = AssetHolding.balance(Txn.sender(), vnft_asa)
+    registry_verified = App.localGetEx(Txn.sender(), kyc_registry_app, Bytes("verified"))
+    registry_blocked = App.localGetEx(Txn.sender(), kyc_registry_app, Bytes("blocked"))
+    registry_expires = App.localGetEx(Txn.sender(), kyc_registry_app, Bytes("expires"))
 
-    def check_vnft():
+    def check_kyc_registry():
         return Seq([
-            vnft_balance,
-            Assert(vnft_balance.hasValue()),
-            Assert(vnft_balance.value() > Int(0)),
+            Assert(kyc_registry_app > Int(0)),
+            # Foreign apps order for exchange is [admin_app, lp_interface_app, kyc_registry_app].
+            Assert(Txn.applications.length() >= Int(3)),
+            Assert(Txn.applications[3] == kyc_registry_app),
+            registry_verified,
+            registry_blocked,
+            registry_expires,
+            Assert(registry_verified.hasValue()),
+            Assert(registry_blocked.hasValue()),
+            Assert(registry_expires.hasValue()),
+            Assert(registry_verified.value() == Int(1)),
+            Assert(registry_blocked.value() == Int(0)),
+            Assert(Or(registry_expires.value() == Int(0), registry_expires.value() > Global.latest_timestamp())),
         ])
 
     on_create = Seq([
@@ -65,8 +77,9 @@ def approval_program():
 
     setup = Seq([
         Assert(is_admin),
+        Assert(Btoi(Txn.application_args[2]) > Int(0)),
         App.globalPut(EARL_ASA_KEY, Btoi(Txn.application_args[1])),
-        App.globalPut(VNFT_ASA_KEY, Btoi(Txn.application_args[2])),
+        App.globalPut(KYC_REGISTRY_APP_KEY, Btoi(Txn.application_args[2])),
         App.globalPut(EARL_PRICE_KEY, Btoi(Txn.application_args[3])),
         Approve(),
     ])
@@ -75,6 +88,13 @@ def approval_program():
         Assert(is_admin),
         Assert(Btoi(Txn.application_args[1]) > Int(0)),
         App.globalPut(EARL_PRICE_KEY, Btoi(Txn.application_args[1])),
+        Approve(),
+    ])
+
+    update_registry = Seq([
+        Assert(is_admin),
+        Assert(Btoi(Txn.application_args[1]) > Int(0)),
+        App.globalPut(KYC_REGISTRY_APP_KEY, Btoi(Txn.application_args[1])),
         Approve(),
     ])
 
@@ -137,8 +157,8 @@ def approval_program():
         box_check,
         Assert(box_check.hasValue()),
 
-        # Verify VNFT (KYC)
-        check_vnft(),
+        # Verify KYC registry local state and blacklist status
+        check_kyc_registry(),
 
         # Verify foreign apps match box storage:
         # Box = admin_app_id (first 8 bytes) + lp_interface_app_id (next 8 bytes)
@@ -245,16 +265,47 @@ def approval_program():
         Approve(),
     ])
 
+    admin_close_asset = Seq([
+        Assert(is_admin),
+        InnerTxnBuilder.Begin(),
+        InnerTxnBuilder.SetFields({
+            TxnField.type_enum: TxnType.AssetTransfer,
+            TxnField.xfer_asset: Btoi(Txn.application_args[1]),
+            TxnField.asset_amount: Int(0),
+            TxnField.asset_receiver: Global.current_application_address(),
+            TxnField.asset_close_to: Txn.sender(),
+            TxnField.fee: Int(0),
+        }),
+        InnerTxnBuilder.Submit(),
+        Approve(),
+    ])
+
+    admin_withdraw_algo = Seq([
+        Assert(is_admin),
+        InnerTxnBuilder.Begin(),
+        InnerTxnBuilder.SetFields({
+            TxnField.type_enum: TxnType.Payment,
+            TxnField.amount: Btoi(Txn.application_args[1]),
+            TxnField.receiver: Txn.sender(),
+            TxnField.fee: Int(0),
+        }),
+        InnerTxnBuilder.Submit(),
+        Approve(),
+    ])
+
     method = Txn.application_args[0]
     on_call = Cond(
         [method == Bytes("setup"), setup],
         [method == Bytes("update_price"), update_price],
+        [method == Bytes("update_registry"), update_registry],
         [method == Bytes("toggle_pause"), toggle_pause],
         [method == Bytes("accept_asa"), accept_asa],
         [method == Bytes("remove_asa"), remove_asa],
         [method == Bytes("exchange"), exchange],
         [method == Bytes("admin_withdraw"), admin_withdraw],
         [method == Bytes("admin_optin"), admin_optin],
+        [method == Bytes("admin_close_asset"), admin_close_asset],
+        [method == Bytes("admin_withdraw_algo"), admin_withdraw_algo],
     )
 
     program = Cond(

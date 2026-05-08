@@ -1,5 +1,5 @@
 import algosdk from 'algosdk';
-import { ALGOD_URL, INDEXER_URL, VNFT_ADMIN_ADDRESS } from './config';
+import { ALGOD_URL, INDEXER_URL, VNFT_ADMIN_ADDRESS, KYC_REGISTRY_APP_ID } from './config';
 
 export const algodClient = new algosdk.Algodv2('', ALGOD_URL, '');
 export const indexerClient = new algosdk.Indexer('', INDEXER_URL, '');
@@ -67,4 +67,43 @@ export async function getVnftAssetId(accountAddress) {
 export async function hasVnft(accountAddress) {
   const assetId = await getVnftAssetId(accountAddress);
   return !!assetId;
+}
+
+function decodeLocalState(localState = []) {
+  const out = {};
+  for (const kv of localState) {
+    const key = atob(kv.key);
+    out[key] = kv.value?.uint ?? kv.value?.bytes ?? null;
+  }
+  return out;
+}
+
+export async function getKycRegistryStatus(accountAddress, appId = KYC_REGISTRY_APP_ID) {
+  if (!accountAddress || !appId) {
+    return { enabled: false, optedIn: false, verified: false, blocked: false, expires: 0, active: false };
+  }
+
+  try {
+    const acct = await indexerClient.lookupAccountByID(accountAddress).do();
+    const appLocal = (acct?.account?.['apps-local-state'] || []).find((app) => app.id === appId);
+    if (!appLocal) {
+      return { enabled: true, optedIn: false, verified: false, blocked: false, expires: 0, active: false };
+    }
+    const state = decodeLocalState(appLocal['key-value'] || []);
+    const expires = Number(state.expires || 0);
+    const now = Math.floor(Date.now() / 1000);
+    const verified = Number(state.verified || 0) === 1;
+    const blocked = Number(state.blocked || 0) === 1;
+    return {
+      enabled: true,
+      optedIn: true,
+      verified,
+      blocked,
+      expires,
+      updated: Number(state.updated || 0),
+      active: verified && !blocked && (expires === 0 || expires > now),
+    };
+  } catch {
+    return { enabled: true, optedIn: false, verified: false, blocked: false, expires: 0, active: false, error: true };
+  }
 }
